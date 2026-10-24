@@ -25,7 +25,7 @@ export function oauthResourcesFor(env: Env, request: Request) {
     legacyGrantResource: origin, // Keep grants written before resource binding.
     scopesSupported: ["deskbeacon:agent", "deskbeacon:device"],
     clientRegistrationEndpoint: "/oauth/register",
-    clientIdMetadataDocumentEnabled: true,
+    clientIdMetadataDocumentEnabled: false,
     refreshTokenTTL: 90 * 24 * 60 * 60,
     refreshTokenIdleTTL: 30 * 24 * 60 * 60
   });
