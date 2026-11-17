@@ -4,6 +4,10 @@ import {spawn} from 'node:child_process';
 import {hostname} from 'node:os';
 import {saveConfig} from './daemon.js';
 import {logEvent} from './diagnostics.js';
+import {networkFetch} from './outbound-network.js';
+import {browserOpenCommand} from './platform-compat.js';
+import {existsSync} from 'node:fs';
+import {configPath,loadConfig} from './daemon.js';
 
 const url64=(value:Buffer)=>value.toString('base64url');
 export const SETUP_PHASES=[
@@ -15,7 +19,7 @@ export const SETUP_PHASES=[
  '保存设备配置',
 ] as const;
 export type SetupStage=typeof SETUP_PHASES[number];
-export type SetupProgress={stage:SetupStage;index:number;startedAt:number;server:string;authorizeUrl?:string;deviceId?:string};
+export type SetupProgress={stage:string;index:number;startedAt:number;server:string;authorizeUrl?:string;deviceId?:string;mode?:'browser'|'device';verificationUri?:string;userCode?:string};
 export function validateSetupUrl(value:string):string{
  let url:URL;
  try{url=new URL(value.trim());}catch{throw Error('请输入有效的服务器 URL，例如 https://beacon.example.com');}
@@ -25,12 +29,49 @@ export function validateSetupUrl(value:string):string{
  return url.origin;
 }
 function defaultOpenBrowser(url:string):void{
- const child=process.platform==='win32'
-  ?spawn('rundll32.exe',['url.dll,FileProtocolHandler',url],{detached:true,stdio:'ignore'})
-  :spawn(process.platform==='darwin'?'open':'xdg-open',[url],{detached:true,stdio:'ignore'});
+ const command=browserOpenCommand(url);
+ const child=spawn(command.program,command.args,{detached:true,stdio:'ignore'});
  child.on('error',error=>logEvent('security','oauth.browser_launch_failed','warn',{error}));
  child.unref();
 }
+/** Shared by browser callback and headless pairing, preserving the same OAuth client/token system. */
+export async function registerSetupClient(server:string,redirect:string,signal?:AbortSignal):Promise<string>{
+ const register=await networkFetch(server+'/oauth/register',{method:'POST',headers:{'content-type':'application/json'},
+  body:JSON.stringify({client_name:'DeskBeacon Device '+hostname(),redirect_uris:[redirect],
+   token_endpoint_auth_method:'none',grant_types:['authorization_code','refresh_token'],response_types:['code']}),signal:signal??null});
+ if(!register.ok)throw Error('OAuth 客户端注册失败：HTTP '+register.status);
+ const client=await register.json() as {client_id:string};
+ if(!client.client_id)throw Error('OAuth 注册响应缺少 client_id');
+ return client.client_id;
+}
+export async function exchangeSetupCode(server:string,clientId:string,redirect:string,code:string,codeVerifier:string,signal?:AbortSignal){
+ const token=await networkFetch(server+'/oauth/token',{method:'POST',signal:signal??null,
+  headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({
+   grant_type:'authorization_code',client_id:clientId,code,redirect_uri:redirect,code_verifier:codeVerifier,
+  })});
+ if(!token.ok)throw Error('OAuth 令牌交换失败：HTTP '+token.status);
+ const credentials=await token.json() as {access_token:string;refresh_token?:string;expires_in?:number};
+ if(!credentials.access_token)throw Error('OAuth 未返回访问令牌');
+ return credentials;
+}
+export function saveSetupCredentials(server:string,clientId:string,credentials:{access_token:string;refresh_token?:string;expires_in?:number},signal?:AbortSignal){
+ signal?.throwIfAborted();
+ let prior:ReturnType<typeof loadConfig>|null=null;
+ if(existsSync(configPath)||existsSync(configPath+'.bak')){
+  try{prior=loadConfig();}
+  catch(error){
+   // A corrupted config without a valid backup must not block re-pairing.
+   if(!(error instanceof Error)||!error.message.startsWith('CONFIG_CORRUPTED:'))throw error;
+  }
+ }
+ saveConfig({...(prior?{proxyAuto:prior.proxyAuto,proxyUrl:prior.proxyUrl}:{}),
+  url:server,clientId,deviceId:clientId,accessToken:credentials.access_token,
+  ...(credentials.refresh_token?{refreshToken:credentials.refresh_token}:{}),
+  ...(credentials.expires_in?{accessTokenExpiresAt:Date.now()+credentials.expires_in*1000}:{}),
+  deviceName:hostname()});
+ logEvent('security','oauth.device_paired','info',{deviceId:clientId,server});
+}
+
 export async function runSetupFlow(rawUrl:string,options:{
  onProgress?:(progress:SetupProgress)=>void;
  openBrowser?:(url:string)=>void;
@@ -73,15 +114,10 @@ export async function runSetupFlow(rawUrl:string,options:{
   const addr=callback.address();if(!addr||typeof addr==='string')throw Error('无法启动本地 OAuth 回调服务');
   const redirect='http://127.0.0.1:'+addr.port+'/callback';
   notify(SETUP_PHASES[2]);
-  const register=await fetch(server+'/oauth/register',{method:'POST',headers:{'content-type':'application/json'},
-   body:JSON.stringify({client_name:'DeskBeacon Device '+hostname(),redirect_uris:[redirect],
-    token_endpoint_auth_method:'none',grant_types:['authorization_code','refresh_token'],response_types:['code']}),signal:options.signal??null});
-  if(!register.ok)throw Error('OAuth 客户端注册失败：HTTP '+register.status);
-  const client=await register.json() as {client_id:string};
-  if(!client.client_id)throw Error('OAuth 注册响应缺少 client_id');
+  const clientId=await registerSetupClient(server,redirect,options.signal);
   const authorize=new URL('/authorize',server);
   authorize.searchParams.set('response_type','code');
-  authorize.searchParams.set('client_id',client.client_id);
+  authorize.searchParams.set('client_id',clientId);
   authorize.searchParams.set('redirect_uri',redirect);
   authorize.searchParams.set('scope','deskbeacon:device');
   authorize.searchParams.set('resource',server);
@@ -108,21 +144,10 @@ export async function runSetupFlow(rawUrl:string,options:{
    if(onAbort)options.signal?.removeEventListener('abort',onAbort);
   }
   notify(SETUP_PHASES[4]);
-  const token=await fetch(server+'/oauth/token',{method:'POST',signal:options.signal??null,
-   headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({
-    grant_type:'authorization_code',client_id:client.client_id,code,redirect_uri:redirect,code_verifier:codeVerifier,
-   })});
-  if(!token.ok)throw Error('OAuth 令牌交换失败：HTTP '+token.status);
-  const credentials=await token.json() as {access_token:string;refresh_token?:string;expires_in?:number};
-  if(!credentials.access_token)throw Error('OAuth 未返回访问令牌');
-  options.signal?.throwIfAborted();
+  const credentials=await exchangeSetupCode(server,clientId,redirect,code,codeVerifier,options.signal);
   notify(SETUP_PHASES[5]);
-  saveConfig({url:server,clientId:client.client_id,deviceId:client.client_id,accessToken:credentials.access_token,
-   ...(credentials.refresh_token?{refreshToken:credentials.refresh_token}:{}),
-   ...(credentials.expires_in?{accessTokenExpiresAt:Date.now()+credentials.expires_in*1000}:{}),
-   deviceName:hostname()});
-  logEvent('security','oauth.device_paired','info',{deviceId:client.client_id,server});
-  return{deviceId:client.client_id,server};
+  saveSetupCredentials(server,clientId,credentials,options.signal);
+  return{deviceId:clientId,server};
  }catch(error){
   logEvent('security','oauth.setup_failed','error',{error,server});
   if(options.signal?.aborted)throw Error('用户取消了设备授权');

@@ -6,7 +6,9 @@ import { existsSync, rmSync, chmodSync, readdirSync, openSync, closeSync, readSy
   mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import type { ClientDaemon } from './daemon.js';
 import { dataDir, loadConfig, saveConfig } from './daemon.js';
-import {getConfigView,setPendingServerUrl} from './config-actions.js';
+import {lockOwnerAlive,ownLockRecord} from './process-identity.js';
+import {getConfigView,setPendingServerUrl,setProxyConfig,setDesktopConfig} from './config-actions.js';
+import {diagnosticsSnapshot} from './diagnostics.js';
 import {detectFileOutputEncoding,decodeOutputPage} from './output-encoding.js';
 export const ipcPath=process.env.DESKBEACON_IPC_PATH ?? (platform()==='win32'?'\\\\.\\pipe\\deskbeacon-'+process.env.USERNAME:
   join(dataDir,'daemon.sock'));
@@ -137,7 +139,13 @@ function resultPage(daemon:ClientDaemon,operationId:unknown,byteOffset:unknown,m
  if(typeof budget!=='number'||!Number.isSafeInteger(budget)||budget<1||budget>maxOutputBytes)
   throw Error('INVALID_OUTPUT_BUDGET');
  const row=daemon.db?.prepare?daemon.db.prepare('SELECT record_path FROM activity WHERE id=?').get(String(operationId)) as {record_path:string|null}|undefined:undefined;
- if(row?.record_path)return daemon.journal.getRecordStream(row.record_path,'result',offset,budget);
+ if(row?.record_path){
+  // For fs_edit, the RESULT inspector reads the actual full diff from the
+  // operation journal. Legacy records without a stored diff retain JSON view.
+  const diff=daemon.journal.getRecordStream(row.record_path,'diff',0,1);
+  if(diff.totalBytes>0)return daemon.journal.getRecordStream(row.record_path,'diff',offset,budget);
+  return daemon.journal.getRecordStream(row.record_path,'result',offset,budget);
+ }
  const bytes=fullResultBytes(daemon,safeId);
  if(!bytes)return{text:'',nextOffset:0,totalBytes:0,hasMore:false,stream:'result',available:false};
  const totalBytes=bytes.length;
@@ -173,24 +181,21 @@ export function startIpc(daemon:ClientDaemon,onExit?:()=>Promise<void>){
  for(let attempt=0;attempt<3&&!owned;attempt++){
    try{
      const fd=openSync(lockPath,'wx',0o600);
-     try{writeFileSync(fd,JSON.stringify({pid:process.pid}));}finally{closeSync(fd);}
+     try{writeFileSync(fd,JSON.stringify(ownLockRecord('runtime')));}finally{closeSync(fd);}
      owned=true;
    }catch(e){
      const error=e as NodeJS.ErrnoException;
      if(error.code!=='EEXIST')throw e;
-     try{
-       const pid=Number(JSON.parse(readFileSync(lockPath,'utf8')).pid);
-       if(pid>0){
-         try{process.kill(pid,0);throw Error('RUNTIME_ALREADY_RUNNING: PID '+pid);}catch(ex){
-           if((ex as NodeJS.ErrnoException).code!=='ESRCH')throw ex;
-         }
-       }
-       rmSync(lockPath,{force:true});
-     }catch(ex){
-       if((ex as Error).message.startsWith('RUNTIME_ALREADY_RUNNING'))throw ex;
-       if((ex as NodeJS.ErrnoException).code==='EPERM')throw ex;
-       rmSync(lockPath,{force:true});
+     let existing:unknown;
+     try{existing=JSON.parse(readFileSync(lockPath,'utf8'));}catch{
+       // A second process can observe a newly created, not-yet-written lock.
+       // Never steal a recently modified lock whose owner is still initializing.
+       try{if(Date.now()-statSync(lockPath).mtimeMs<3000)throw Error('RUNTIME_LOCK_INITIALIZING');}
+       catch(ex){if((ex as Error).message==='RUNTIME_LOCK_INITIALIZING')throw ex;}
      }
+     if(lockOwnerAlive(existing,'runtime'))
+       throw Error('RUNTIME_ALREADY_RUNNING: PID '+String((existing as {pid:number}).pid));
+     rmSync(lockPath,{force:true});
    }
  }
  if(!owned)throw Error('RUNTIME_LOCK_UNAVAILABLE');
@@ -282,11 +287,21 @@ export function startIpc(daemon:ClientDaemon,onExit?:()=>Promise<void>){
            }
            else if(request.action==='status-lite')result=await daemon.status(false);
            else if(request.action==='status')result=await daemon.status();
+           else if(request.action==='diagnostics')result={
+             schemaVersion:1,scope:'runtime',capturedAt:new Date().toISOString(),
+             pid:process.pid,uptimeSeconds:Math.round(process.uptime()),
+             memoryRssBytes:process.memoryUsage().rss,loggers:diagnosticsSnapshot()
+           };
            else if(request.action==='config-get')result=getConfigView();
            else if(request.action==='config-set'){
              const key=request.key,value=String(request.value??'').trim();
              if(key==='name')result={name:await daemon.rename(value)};
              else if(key==='url')result=setPendingServerUrl(value);
+             else if(key==='proxy-auto'||key==='proxy-url'){result=setProxyConfig(key,value);daemon.reconnectForProxyChange();}
+             else if(key==='desktop-mode'||key==='desktop-cursor'){
+               result=setDesktopConfig(key,value);
+               if(key==='desktop-cursor'&&value==='false')await daemon.stopDesktopCursor();
+             }
              else throw Error('UNKNOWN_CONFIG_KEY');
            }
            else if(request.action==='activity-list'){
@@ -338,8 +353,8 @@ export function startIpc(daemon:ClientDaemon,onExit?:()=>Promise<void>){
  });
  const releaseLock=()=>{
    try{
-     const current=JSON.parse(readFileSync(lockPath,'utf8')) as {pid:number};
-     if(current.pid===process.pid)rmSync(lockPath,{force:true});
+     const current=JSON.parse(readFileSync(lockPath,'utf8')) as {pid:number;processStartedAt?:number};
+     if(current.pid===process.pid&&(!current.processStartedAt||Math.abs(current.processStartedAt-(Date.now()-process.uptime()*1000))<5000))rmSync(lockPath,{force:true});
    }catch{}
    if(process.platform!=='win32')try{rmSync(ipcPath,{force:true});}catch{}
  };

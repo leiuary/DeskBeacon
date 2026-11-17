@@ -2,156 +2,135 @@
 
 让 AI 连接并使用你的电脑。
 
-DeskBeacon 是一个开源、自托管的远程设备 MCP 服务。你可以通过 Claude、Codex、ChatGPT 等支持远程 MCP 和 OAuth 授权的 AI 客户端，操作已连接的电脑，并在本地终端中查看执行过程、检查结果或停止任务。
+DeskBeacon 是一个开源、自托管的远程设备 MCP 服务。连接后，你可以在 ChatGPT、Claude、Codex 等支持 MCP 的 AI 客户端中，让 AI 在已授权的设备上执行操作。
 
 ## 可以做什么
 
-- **执行命令**：运行脚本、构建项目、执行测试，或启动开发服务器等后台任务。
-- **处理文件**：浏览、搜索、读取和编辑文件，压缩与解压归档。
-- **传输文件**：在 AI 和设备之间上传、下载文件；可用方式取决于 AI 客户端的支持。
-- **排查问题**：检查网络连接、访问设备上的本地服务、查看系统和进程状态、获取截图。
-- **连接多台设备**：通过同一个服务器管理多台电脑，为设备分别命名。
+- **执行命令**：运行脚本、构建项目、启动或停止后台任务。
+- **处理文件**：查看、搜索、编辑文件，压缩或解压。
+- **传输文件**：在 AI 客户端与设备之间传输文件。
+- **查看设备状态**：检查进程、网络、运行状况，并在受支持的平台上截图。
+- **操作桌面**：在支持的图形系统上读取应用与控件树、查找元素、语义点击、编辑输入框及管理窗口。
+- **管理多台设备**：通过一个服务器连接多台电脑，分别为它们命名。
 
-## 开始使用
-
-只需完成三步：**部署一个服务器 → 在电脑上安装客户端 → 将服务器添加到 AI 客户端**。服务器只需部署一次；每台需要连接的电脑各安装一次客户端。
+## 快速开始
 
 ### 1. 部署服务器
 
-准备好 [Cloudflare 账号](https://dash.cloudflare.com/sign-up)和 GitHub 账号，然后点击：
+准备 Cloudflare 和 GitHub 账号，点击：
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2FRavelloH%2FDeskBeacon)
 
-1. 按页面提示登录并连接 GitHub，将项目复制到自己的账号。
-2. 选择 Cloudflare 账号，确认仓库名称和服务名称。
-3. 在 `MCP_AUTH_SECRET` 中设置你自己的授权密码。之后连接电脑和 AI 时，都使用这个密码。
-4. 确认部署。Cloudflare 会创建所需资源并发布服务。[部署按钮说明](https://developers.cloudflare.com/workers/platform/deploy-buttons/)
-5. 部署成功后，复制服务的 HTTPS 地址，例如 `https://deskbeacon.your-account.workers.dev`。
+按照页面提示复制仓库、选择 Cloudflare 账号，并设置自己的授权密码 `MCP_AUTH_SECRET`。
 
-如果页面要求填写构建设置，请使用以下内容：
+如果需要填写构建设置，请使用：
 
-| 设置 | 填写内容 |
+| 设置 | 值 |
 | --- | --- |
-| 根目录 | 仓库根目录 `/` |
-| 构建命令 | `pnpm --filter @deskbeacon/protocol build` |
-| 部署命令 | `pnpm run deploy` |
-| 构建环境变量 `NODE_VERSION` | `24` |
-| 构建环境变量 `PNPM_VERSION` | `11.1.3` |
+| 根目录 | `/` |
+| 构建命令 | `pnpm build` |
+| 部署命令 | `pnpm deploy` |
+| `NODE_VERSION` | `24` |
+| `PNPM_VERSION` | `11.1.3` |
 
-构建版本设置可参考 [Cloudflare 构建环境说明](https://developers.cloudflare.com/workers/ci-cd/builds/build-image/)。如果部署时没有出现密码输入框，可在该 Worker 的 **Settings → Variables and Secrets** 中新增名为 `MCP_AUTH_SECRET` 的 **Secret**，填入密码并保存部署，再连接设备。
+部署后记下服务器地址，例如 `https://deskbeacon.your-account.workers.dev`。
 
-后文以 `https://deskbeacon.your-account.workers.dev` 为例，请替换为你自己的地址。电脑配对使用这个地址，AI 客户端（ChatGPT、Claude 等）使用时末尾加上 `/mcp` 的地址。
-
-<details>
-<summary>手动部署</summary>
-
-在本机安装 [Node.js 24 或更新版本](https://nodejs.org/)和 [pnpm 11](https://pnpm.io/installation)，然后执行：
+也可以在自己的电脑上手动部署：
 
 ```bash
 git clone https://github.com/RavelloH/DeskBeacon.git
 cd DeskBeacon
 pnpm install --frozen-lockfile
-pnpm --filter @deskbeacon/protocol build
-cd apps/server
-pnpm exec wrangler login
-pnpm exec wrangler kv namespace create OAUTH_KV
+pnpm build
+pnpm --filter @deskbeacon/server exec wrangler login
+pnpm deploy
 ```
 
-把最后一条命令返回的 ID 填入当前目录 `wrangler.jsonc` 中 `OAUTH_KV` 的 `id`，再设置授权密码并部署：
+### 2. 连接电脑
 
-```bash
-pnpm exec wrangler secret put MCP_AUTH_SECRET
-pnpm exec wrangler deploy
-```
-
-密码在命令提示时输入。部署结束后，记下输出的 HTTPS 地址。
-
-</details>
-
-### 2. 安装并连接客户端
-
-在需要让 AI 操作的电脑上安装 [Node.js 24 或更新版本](https://nodejs.org/)，再打开终端执行：
+安装 [Node.js 24 或更新版本](https://nodejs.org/)，然后运行：
 
 ```bash
 npm install -g deskbeacon
 deskbeacon
 ```
 
-配对时会打开浏览器。输入部署时设置的授权密码，完成设备授权；回到终端后，运行 `deskbeacon` 并等待界面显示已连接。
+首次启动时填入自己的服务器地址，并按提示在浏览器中使用授权密码完成配对。连接其他电脑时，重复相同的步骤。
 
-也可以直接运行 `npx deskbeacon`，首次启动时按提示输入服务器地址并完成授权。使用 npm 或 npx 安装客户端无需下载源码。
+你也可以使用 `npx deskbeacon`，无需全局安装。
 
-需要连接更多电脑时，在每台电脑上重复上述步骤，使用同一个服务器地址。保持电脑开机、联网，并让 DeskBeacon 运行，AI 才能访问该设备。不同系统的截图等功能受系统权限和运行环境影响。
+如果电脑没有浏览器（如 SSH 终端或 VPS），在该设备上运行：
+
+```bash
+deskbeacon setup --device --url https://你的服务器地址
+```
+
+然后在手机或其他电脑上打开终端显示的地址，输入验证码并确认授权。
 
 ### 3. 连接 AI 客户端
 
-在支持远程 MCP（Streamable HTTP）和 OAuth 授权的 AI 客户端中，添加服务器：
+在支持远程 MCP 的 AI 客户端中添加：
 
 ```text
 https://deskbeacon.your-account.workers.dev/mcp
 ```
 
-按提示完成授权，输入相同的授权密码。连接成功后，可以直接对 AI 说：
+按提示授权后，就可以让 AI 查看已连接的设备或执行操作。如果连接了多台电脑，请在请求中明确指定目标设备。
 
-> 列出我已连接的设备。
->
-> 查看我的开发电脑上有哪些项目。
->
-> 在这台电脑的项目目录中运行测试，并告诉我结果。
->
-> 启动项目的开发服务器，再检查本地页面是否能访问。
+## 常用命令
 
-如果有多台设备，请在请求中说明设备名称和目标目录。远程操作由 AI 发起，本地界面用于查看活动和停止任务。
+| 命令 | 用途 |
+| --- | --- |
+| `deskbeacon` | 打开终端界面并连接设备 |
+| `deskbeacon setup --url <服务器地址>` | 更换服务器或重新配对 |
+| `deskbeacon status` | 查看连接状态 |
+| `deskbeacon config name "我的电脑"` | 修改设备名称 |
+| `deskbeacon service start` | 在后台运行 |
+| `deskbeacon service stop` | 停止后台服务 |
+| `deskbeacon service restart` | 重启后台服务 |
+| `deskbeacon config proxy-auto true` | 自动发现系统代理 |
+| `deskbeacon config proxy-url http://127.0.0.1:7890` | 手动指定代理 |
+| `deskbeacon config proxy-url null` | 清除手动代理 |
+| `deskbeacon doctor` | 检查运行环境 |
+| `deskbeacon service logs` | 查看客户端日志 |
+| `deskbeacon help` | 查看完整帮助 |
 
-## 日常使用
+后台服务不会自动设置开机启动。需要 AI 随时连接设备时，请确保设备已开机、联网且 DeskBeacon 正在运行。
 
-### 打开界面与后台运行
-
-运行 `deskbeacon` 打开终端界面。常用操作如下，完整快捷键可在界面中按 `?` 查看：
+## 终端界面
 
 | 按键 | 操作 |
 | --- | --- |
 | `↑` / `↓` | 选择记录 |
-| `Tab` | 切换活动、详情和后台任务区域 |
+| `Tab` | 切换活动、详情和后台任务 |
 | `s` | 搜索活动 |
 | `i` / `o` | 查看完整输入 / 输出 |
 | `/` | 打开命令面板 |
 | `x` | 停止选中的任务 |
+| `?` | 查看快捷键 |
 | `q` | 退出界面 |
 
-希望关闭终端后仍保持设备在线，可以启动后台服务：
+## 桌面控制
+
+DeskBeacon 默认安装桌面自动化依赖，但不会随终端界面或后台 Runtime 启动而加载它；只有调用 `desktop_*` 等相关工具、或使用 `screen_capture` 截取应用/窗口时，才会检查平台、权限并按需执行原生程序。
+
+桌面控制支持 Windows、macOS 及满足原生运行条件的 Linux 图形会话；不支持的系统（如 Android / Termux）会返回明确错误，不影响文件、命令或网络工具。普通截图仍使用 DeskBeacon 原有实现。
+
+默认采用非侵入式 Headless 控件操作。真实键鼠或需要切换焦点的操作必须显式请求 Headed，并经设备端权限策略允许；不会自动从 Headless 回退到 Headed。不同 Agent 的操作记录继续出现在原有活动历史与详情界面，输入文本和截图不会被完整保存在普通操作日志中。
+
+桌面策略由设备使用者在本机管理，不允许远程 Agent 修改。默认 `desktop-mode=headed_allowed`、`desktop-cursor=true`，可以通过现有 TUI 的 `/config` 或 CLI 修改：
 
 ```bash
-deskbeacon service start
+deskbeacon config desktop-mode observe_only
+deskbeacon config desktop-mode headless_only
+deskbeacon config desktop-mode headed_allowed
+deskbeacon config desktop-cursor true
+deskbeacon config desktop-cursor false
 ```
 
-之后运行 `deskbeacon` 可随时查看活动；退出界面时，已启动的后台服务会继续运行。后台运行需先手动启动，不代表已设置开机自启。
+`observe_only` 只允许观察界面；`headless_only` 允许语义控件操作；`headed_allowed` 额外允许 Agent 显式请求真实键鼠输入。`desktop_app` 启动应用时可以通过 `launchArgs` 传入文档路径，并通过 `launchState` 分别确认进程启动、窗口出现和前台焦点；Ref 会绑定到当前 Agent 授权和会话，无法直接使用其他 Agent 的 Snapshot Ref。多 Agent Cursor Overlay 默认允许显示，但仍只在遇到实际 Desktop 调用时按需创建，不会随 DeskBeacon 启动；关闭后会回收运行中的共享可视化 Session。截图和无障碍快照可能包含敏感内容，请仅将设备授权给可信的 Agent。
 
-```bash
-deskbeacon status          # 查看设备状态
-deskbeacon service restart # 重启后台服务
-deskbeacon service stop    # 停止服务并断开设备
-```
-
-普通启动后用 `q` 正常退出会断开设备；若终端意外关闭，设备可能仍在线，可用 `deskbeacon status` 检查，并用 `deskbeacon service stop` 停止。
-
-### 修改名称与服务器地址
-
-设备连接后，可以为它设置容易辨认的名字：
-
-```bash
-deskbeacon config name "我的开发电脑"
-```
-
-更换服务器时，重新配对：
-
-```bash
-deskbeacon setup --url https://你的新服务器地址
-```
-
-### 更新与排查
-
-使用全局安装的客户端时，先退出界面并停止后台服务，再更新：
+## 更新与排查
 
 ```bash
 deskbeacon service stop
@@ -159,16 +138,6 @@ npm install -g deskbeacon@latest
 deskbeacon
 ```
 
-需要继续后台运行时，将最后一条命令换为 `deskbeacon service start`。使用 npx 时，可用 `npx deskbeacon@latest` 启动最新版。
-
-服务器通过 Cloudflare 部署按钮创建后，可以在自己的仓库中同步上游更新，再到 Cloudflare 的构建页面重新部署。已有服务器升级时，请保留原来的地址、密码和已绑定资源。
-
-遇到连接或运行问题时，先检查服务器地址、密码，以及设备是否在线，再运行：
-
-```bash
-deskbeacon doctor
-deskbeacon service logs
-deskbeacon help
-```
+如果设备无法连接，先确认服务器地址、网络和后台服务状态，再运行 `deskbeacon doctor`。
 
 DeskBeacon 使用运行客户端的系统账户权限执行操作。请妥善保管授权密码，仅授权你信任的 AI 客户端。

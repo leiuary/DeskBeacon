@@ -1,8 +1,15 @@
 import si from 'systeminformation';
 import {cpus,freemem,networkInterfaces,totalmem} from 'node:os';
+import {cpuCount,androidHomeDiskSnapshot} from './platform-compat.js';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 const execFileAsync=promisify(execFile);
+
+/** Convert DeskBeacon public screen coordinates to Sharp's extraction coordinate keys. */
+export function sharpRegion(rect:{x:number;y:number;width:number;height:number}){
+ return {left:rect.x,top:rect.y,width:rect.width,height:rect.height};
+}
+
 
 async function windowsProcessOwners():Promise<Map<number,{name:string;user:string|null}>> {
  const map=new Map<number,{name:string;user:string|null}>();
@@ -45,8 +52,7 @@ async function windowsNetstat(protocol:string):Promise<any[]> {
 import { lookup, resolve as resolveDns } from 'node:dns/promises';
 import { connect as tcpConnect, isIP } from 'node:net';
 import { connect as tlsConnect } from 'node:tls';
-import screen from 'screenshot-desktop';
-import sharp from 'sharp';
+import {networkFetch} from './outbound-network.js';
 type I=Record<string,any>;
 const limited=(s:string,max:number)=>s.length>max?s.slice(0,max):s;
 export async function systemTool(name:string,i:I){
@@ -56,15 +62,17 @@ export async function systemTool(name:string,i:I){
      si.currentLoad(),
      i.includeDisks===false?Promise.resolve([]):si.fsSize()]);
    const cpu=cpus(),available=freemem(),total=totalmem();
+   const usableDisks=process.platform==='android'&&i.includeDisks!==false&&disks.length===0?
+     androidHomeDiskSnapshot():disks;
    const network=i.includeNetwork===false?[]:Object.entries(networkInterfaces()).map(([name,addresses])=>({
      name,ip4:addresses?.find(x=>x.family==='IPv4')?.address??'',
      ip6:addresses?.find(x=>x.family==='IPv6')?.address??'',
      internal:addresses?.every(x=>x.internal)??false
    }));
    return {timestamp:new Date().toISOString(),platform:process.platform,architecture:process.arch,
-     cpu:{model:cpu[0]?.model??'unknown',cores:cpu.length,loadPercent:load.currentLoad},
+     cpu:{model:cpu[0]?.model??(process.platform==='android'?process.arch:'unknown'),cores:cpuCount(),loadPercent:load.currentLoad},
      memory:{totalBytes:total,availableBytes:available,usedBytes:total-available},
-     disks:(disks as any[]).map(x=>({mount:x.mount,totalBytes:x.size,usedBytes:x.used,usedPercent:x.use})),
+     disks:(usableDisks as any[]).map(x=>({mount:x.mount,totalBytes:x.totalBytes??x.size,usedBytes:x.usedBytes??x.used,usedPercent:x.usedPercent??x.use})),
      network};
  }
  case 'system_processes':{
@@ -95,14 +103,16 @@ export async function systemTool(name:string,i:I){
      pid:r.pid,process:r.process||owners.get(r.pid)?.name||null})),truncated:rows.length>(i.limit??200)};
  }
  case 'screen_capture':{
+   if(process.platform==='android')throw Error('SCREEN_UNAVAILABLE: screenshot-desktop does not support Android / Termux');
    if(process.platform==='linux'&&!process.env.DISPLAY&&!process.env.WAYLAND_DISPLAY)
      throw Error('SCREEN_UNAVAILABLE: no graphical desktop session (DISPLAY/WAYLAND_DISPLAY)');
+   const [{default:screen},{default:sharp}]=await Promise.all([import('screenshot-desktop'),import('sharp')]);
    const monitors=await screen.listDisplays();
    const selected=i.monitor===undefined?undefined:monitors[i.monitor];
    if(i.monitor!==undefined&&!selected)throw Error('SCREEN_UNAVAILABLE: monitor not found');
    const buffer=await screen({format:'png',...(selected?{screen:selected.id}:{})});
    let image=sharp(buffer);
-   if(i.rect)image=image.extract(i.rect);
+   if(i.rect)image=image.extract(sharpRegion(i.rect));
    image=image.resize({width:i.maxWidth??1920,height:i.maxHeight??1080,fit:'inside',withoutEnlargement:true});
    const output=i.format==='png'?await image.png().toBuffer():await image.jpeg({quality:Math.round((i.quality??0.8)*100)}).toBuffer();
    const meta=await sharp(output).metadata();
@@ -157,14 +167,16 @@ export async function networkTool(name:string,i:I){
    const started=Date.now(),controller=new AbortController();
    const timer=setTimeout(()=>controller.abort(),i.timeoutMs??5000);
    try{
-     const response=await fetch(i.url,{method:i.method??'GET',headers:i.headers??{},
+     const response=await networkFetch(i.url,{method:i.method??'GET',headers:i.headers??{},
        body:i.body,redirect:i.redirect??'follow',signal:controller.signal});
-     const reader=response.body?.getReader();
      const sizeLimit=i.maxResponseBytes??65536;
-     const chunks:Uint8Array[]=[];let total=0,truncated=false;
-     if(reader)while(true){
-       const {done,value}=await reader.read();if(done)break;
-       if(total+value.byteLength>sizeLimit){chunks.push(value.slice(0,Math.max(0,sizeLimit-total)));truncated=true;await reader.cancel();break;}
+     const chunks:Buffer[]=[];let total=0,truncated=false;
+     if(response.body)for await(const part of response.body){
+       const value=Buffer.isBuffer(part)?part:Buffer.from(part);
+       if(total+value.byteLength>sizeLimit){
+         chunks.push(value.subarray(0,Math.max(0,sizeLimit-total)));
+         truncated=true;(response.body as import('node:stream').Readable).destroy();break;
+       }
        chunks.push(value);total+=value.byteLength;
      }
      const bytes=Buffer.concat(chunks.map(x=>Buffer.from(x)));

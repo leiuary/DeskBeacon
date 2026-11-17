@@ -1,5 +1,5 @@
 ﻿import { DurableObject } from "cloudflare:workers";
-import { LIMITS, PROTOCOL_VERSION, ProtocolMessageSchema, type ProtocolMessage } from "@deskbeacon/protocol";
+import { createPreview,previewFromEdges,LIMITS, PROTOCOL_VERSION, ProtocolMessageSchema, type ProtocolMessage } from "@deskbeacon/protocol";
 import type { Env, DeviceRecord } from "./env.js";
 
 type Waiter = {
@@ -103,6 +103,25 @@ export class DeviceSession extends DurableObject<Env> {
   }
   async fetch(request: Request): Promise<Response> {
     const pathname = new URL(request.url).pathname;
+    if(pathname==="/security/consume"){
+      if(request.method!=="POST")return json({error:"method_not_allowed"},405);
+      const value=await request.json().catch(()=>null) as {id?:unknown;expires?:unknown}|null;
+      if(!value||typeof value.id!=="string"||!(/^(?:challenge:[a-f0-9]{64}|proof:[a-f0-9-]{36})$/.test(value.id))||
+         typeof value.expires!=="number"||!Number.isSafeInteger(value.expires)||
+         value.expires<=Date.now()||value.expires>Date.now()+600_000)
+        return json({consumed:false},400);
+      this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS cap_used (id TEXT PRIMARY KEY, expires INTEGER NOT NULL)");
+      this.ctx.storage.sql.exec("DELETE FROM cap_used WHERE expires<=?",Date.now());
+      const old=this.ctx.storage.sql.exec("SELECT id FROM cap_used WHERE id=?",value.id).toArray();
+      if(old.length)return json({consumed:false},409);
+      this.ctx.storage.sql.exec("INSERT INTO cap_used(id,expires) VALUES(?,?)",value.id,value.expires);
+      return json({consumed:true});
+    }
+    if(pathname==="/revoke"){
+      if(request.method!=="POST")return json({error:"method_not_allowed"},405);
+      for(const ws of this.ctx.getWebSockets())if(ws.readyState===WebSocket.OPEN)ws.close(4003,"device authorization revoked");
+      return json({revoked:true});
+    }
     if (pathname === "/connect") {
       if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return json(failure("INVALID_INPUT","Expected WebSocket upgrade"),426);
       const deviceId = request.headers.get("x-device-id");
@@ -193,7 +212,8 @@ export class DeviceSession extends DurableObject<Env> {
 
   private async dispatch(body:Rpc):Promise<Record<string,unknown>> {
     const isFg=FG.has(body.name);
-    const canCancel=isFg||body.name==='batch';
+    const canCancel=isFg||body.name==='batch'||body.name.startsWith('desktop_')||
+      (body.name==='screen_capture'&&['app','window'].includes(String(body.input.target)));
     const input=body.input;
     const digest=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(JSON.stringify([body.name,input])));
     const requestHash=Array.from(new Uint8Array(digest)).map(x=>x.toString(16).padStart(2,"0")).join("");
@@ -315,6 +335,7 @@ export class DeviceSession extends DurableObject<Env> {
       const name=msg.payload.name.trim();
       const key="device:"+attachment.deviceId;
       const existing=await this.env.OAUTH_KV.get(key,"json") as DeviceRecord|null;
+      if(!existing){ws.close(4003,'device registration revoked');return;}
       const record:DeviceRecord={
         ...existing,deviceId:attachment.deviceId!,label:name,
         lastSeenAt:existing?.lastSeenAt??new Date().toISOString(),
@@ -370,26 +391,22 @@ export class DeviceSession extends DurableObject<Env> {
         this.finish(msg.operationId,failure("RESULT_INVALID","Missing foreground text begin"),"failed");return;
       }
       const data=msg.payload.result;
-      // Preserve the head AND the tail, where build failures commonly appear.
+      // Same head/tail algorithm as local DETAIL and Batch previews.
+      // Query only the edges for large results: never load 16 MiB into a DO preview.
       const totalOutputBytes=Number(row.stdout_bytes??0)+Number(row.stderr_bytes??0);
       const clipped=totalOutputBytes>LIMITS.resultPreviewBytes;
-      let outputPreview:string;
+      let preview;
       if(!clipped){
         const all=this.ctx.storage.sql.exec("SELECT content FROM chunks WHERE op_id=? ORDER BY stream,idx",msg.operationId).toArray() as Row[];
-        outputPreview=all.map(r=>String(r.content)).join("");
+        preview=createPreview(all.map(r=>String(r.content)).join(""),LIMITS.resultPreviewBytes);
       }else{
         const first=this.ctx.storage.sql.exec("SELECT content FROM chunks WHERE op_id=? ORDER BY stream,idx LIMIT 8",msg.operationId).toArray() as Row[];
         const last=this.ctx.storage.sql.exec("SELECT content FROM chunks WHERE op_id=? ORDER BY stream DESC,idx DESC LIMIT 8",msg.operationId).toArray() as Row[];
-        const budget=Math.floor((LIMITS.resultPreviewBytes-128)/2);
-        const head=new TextDecoder().decode(new TextEncoder().encode(first.map(r=>String(r.content)).join("")).slice(0,budget));
-        const tailBytes=new TextEncoder().encode(last.reverse().map(r=>String(r.content)).join(""));
-        let start=Math.max(0,tailBytes.byteLength-budget);
-        while(start<tailBytes.length&&(tailBytes[start]!&0xc0)===0x80)start++;
-        const tail=new TextDecoder().decode(tailBytes.slice(start));
-        outputPreview=head+"\n... [output truncated; use operation_output] ...\n"+tail;
+        preview=previewFromEdges(first.map(r=>String(r.content)).join(""),
+          last.reverse().map(r=>String(r.content)).join(""),totalOutputBytes,LIMITS.resultPreviewBytes);
       }
       this.finish(msg.operationId,{status:"completed",data,...(FG.has(row.tool)?{
-        outputPreview,previewTruncated:clipped,
+        outputPreview:preview.text,previewTruncated:preview.truncated,outputPreviewMeta:preview,
         stdoutBytes:Number(row.stdout_bytes??0),stderrBytes:Number(row.stderr_bytes??0),totalOutputBytes,
         historyAvailable:true
       }: {})},"completed");

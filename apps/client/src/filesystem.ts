@@ -4,9 +4,10 @@ import {createInterface} from 'node:readline';
 import { createHash } from 'node:crypto';
 import { resolve, dirname, basename, join, relative, isAbsolute, sep } from 'node:path';
 import { spawn } from 'node:child_process';
-import { rgPath } from '@vscode/ripgrep';
+import {ripgrepExecutable} from './ripgrep.js';
 import { editText, type EditTextRequest } from './edit-text.js';
-import { diffLines } from 'diff';
+import { diffLines,createTwoFilesPatch } from 'diff';
+import {createPreview} from '@deskbeacon/protocol';
 import AdmZip from 'adm-zip';
 import * as tar from 'tar';
 
@@ -74,8 +75,12 @@ function searchDirectoryGlob(path:string,root:string,glob:string):boolean{
  const regex=new RegExp('^'+expression+'$');
  return regex.test(candidate)||(!part.includes('/')&&regex.test(basename(path)));
 }
+function isNameGlobPattern(pattern:string):boolean{return /[*?\[\]{}]/.test(pattern);}
 function includeSearchDirectory(path:string,root:string,input:Input):boolean{
- if(input.pattern&&!basename(path).includes(String(input.pattern)))return false;
+ if(input.pattern){
+  const pattern=String(input.pattern);
+  if(isNameGlobPattern(pattern)?!searchDirectoryGlob(path,root,pattern):!basename(path).includes(pattern))return false;
+ }
  const globs:(string[])=input.glob??[];
  const positive=globs.filter(g=>!g.startsWith('!'));
  if(positive.length&&!positive.some(g=>searchDirectoryGlob(path,root,g)))return false;
@@ -116,8 +121,10 @@ async function search(name:string,input:Input,path:string){
  if(name==='fs_find'){
    args.push('--files');
    if(input.pattern){
-     const literal=String(input.pattern).replace(/[?*\[\]{}\\]/g, '\\$&');
-     args.push('-g','*'+literal+'*');
+     const pattern=String(input.pattern);
+     // Plain words remain substring searches; wildcard patterns use ripgrep globs.
+     const glob=isNameGlobPattern(pattern)?pattern:'*'+pattern.replace(/[?*\[\]{}\\]/g, '\\$&')+'*';
+     args.push('-g',glob);
    }
  }
  else args.push('--json','--line-number','--color','never',...(input.literal?['--fixed-strings']:[]),...(input.caseSensitive?[]:['--ignore-case']),
@@ -126,8 +133,9 @@ async function search(name:string,input:Input,path:string){
  if(input.respectIgnore===false)args.push('--no-ignore');
  for(const g of input.glob??[])args.push('-g',g);
  args.push('--',path);
+ const executable=await ripgrepExecutable();
  return await new Promise<any>((accept,reject)=>{
-   const child=spawn(rgPath,args,{windowsHide:true,stdio:['ignore','pipe','pipe']});
+   const child=spawn(executable,args,{windowsHide:true,stdio:['ignore','pipe','pipe']});
    let stdout='',stderr='',exceeded=false;
    const max=Math.min(input.maxBytes??2*1024*1024,8*1024*1024);
    const timer=setTimeout(()=>{exceeded=true;child.kill();},input.timeoutMs??30000);
@@ -246,7 +254,7 @@ async function archive(i:Input) {
    filter:(p:string,e:any)=>{safeArchiveEntry(target,p);return e.type!=='SymbolicLink'&&e.type!=='Link';}});
  return{extracted:count,expandedBytes:total,target};
 }
-export async function fileTool(tool:string,input:Input,workspace?:string):Promise<any>{
+export async function fileTool(tool:string,input:Input,workspace?:string,onDiff?:(diff:string)=>void):Promise<any>{
  const path=input.path?location(input.path,workspace):'';
  switch(tool){
  case 'fs_read_many':{
@@ -355,14 +363,21 @@ export async function fileTool(tool:string,input:Input,workspace?:string):Promis
      addedLines=difference.filter(part=>part.added).reduce((sum,part)=>sum+(part.count??0),0);
      removedLines=difference.filter(part=>part.removed).reduce((sum,part)=>sum+(part.count??0),0);
    }
-   const diff=input.dryRun&&result.text!==original
-     ?(await import('diff')).createTwoFilesPatch(path,path,original,result.text,'before','after',{context:3}).slice(0,65_536)
-     :undefined;
+   // Preserve the REAL before/after diff for every edit, not an approximation
+   // generated from input snippets. The complete diff is saved locally; only
+   // its bounded preview is returned through the MCP result frame.
+   const fullDiff=result.text!==original
+     ?createTwoFilesPatch(path,path,original,result.text,'before','after',{context:3})
+     :'';
    if(!input.dryRun&&result.text!==original)await atomicWrite(path,changed,true);
+   if(fullDiff&&onDiff)onDiff(fullDiff);
+   const preview=createPreview(fullDiff,8192);
+   const {text:diffPreviewText,...diffPreviewMeta}=preview;
    return{path,sha256:hash(changed),bytes:changed.length,
      replacements:result.replacements,normalizedEol:result.normalizedEol,
      changed:result.text!==original,dryRun:input.dryRun===true,
-     ...(diff!==undefined?{diff,diffTruncated:diff.length>=65_536}:{}) ,
+     ...(fullDiff?{diff:diffPreviewText,diffTruncated:preview.truncated,
+       diffStored:!!onDiff,diffBytes:preview.originalBytes,diffPreviewMeta}:{}),
      ...(addedLines!==undefined&&removedLines!==undefined?{addedLines,removedLines}:{})};
  }
  case 'fs_manage':{

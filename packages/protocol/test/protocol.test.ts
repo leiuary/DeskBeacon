@@ -10,8 +10,12 @@ import {
 } from '../src/index.js';
 
 describe('protocol schemas', () => {
-  it('registers the 36 MCP tools with universal batch and paged child output', () => {
-    expect(Object.keys(toolInputSchemas)).toHaveLength(36);
+  it('registers core tools and the initial Desktop MCP tools', () => {
+    expect(Object.keys(toolInputSchemas)).toHaveLength(50);
+    for(const name of ['desktop_status','desktop_list','desktop_snapshot','desktop_find',
+      'desktop_get','desktop_click','desktop_input','desktop_wait',
+      'desktop_control','desktop_press','desktop_pointer','desktop_app','desktop_window','desktop_session'])
+      expect(toolInputSchemas).toHaveProperty(name);
   });
 
   it('round-trips a versioned operation dispatch message', () => {
@@ -94,6 +98,24 @@ describe('protocol schemas', () => {
       {mode:'replace',oldText:'old'}, {mode:'replace',oldText:'old',newText:'new',patch:'bad'},
       {mode:'replace_many',replacements:[]},{mode:'patch',patch:'patch',oldText:'unexpected'},
     ])expect(toolInputSchemas.fs_edit.safeParse({...base,...invalid}).success).toBe(false);
+  });
+
+  it('exports desktop launch parameters through the public MCP JSON schema', () => {
+    const schema=z.toJSONSchema(toolInputSchemas.desktop_app) as {
+      type?:string;properties?:Record<string,unknown>;required?:string[];
+    };
+    expect(schema.type).toBe('object');
+    expect(schema.properties).toHaveProperty('launchArgs');
+    expect(schema.properties).toHaveProperty('workingDirectory');
+    expect(schema.properties).toHaveProperty('activate');
+    expect(toolInputSchemas.desktop_app.safeParse({
+      deviceId:'dev',action:'launch',app:'notepad',
+      launchArgs:['C:\\Temp\\report.txt'],workingDirectory:'C:\\Temp',
+    }).success).toBe(true);
+    expect(toolInputSchemas.desktop_app.safeParse({
+      deviceId:'dev',action:'close',app:'notepad',
+      launchArgs:['C:\\Temp\\report.txt'],
+    }).success).toBe(false);
   });
 
   it('rejects additional fields and oversized inline transfer data', () => {

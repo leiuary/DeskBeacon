@@ -55,7 +55,7 @@ const demoBytes=Object.values(release.metafile.outputs).flatMap(output=>
   .map(([path,info])=>({path,bytes:info.bytesInOutput})));
 if(demoBytes.some(item=>item.bytes>0))throw Error('Release includes Demo bytes: '+JSON.stringify(demoBytes));
 const optionalDependencies=Object.fromEntries(
- Object.keys(source.optionalDependencies).map(name=>[name,source.version]));
+ Object.entries(source.optionalDependencies).map(([name,requested])=>[name,requested==='workspace:*'?source.version:requested]));
 const pkg={
  name:source.name,version:source.version,description:source.description,type:'module',license:'MIT',
  repository:{type:'git',url:'git+https://github.com/RavelloH/DeskBeacon.git',directory:'apps/client'},
@@ -82,7 +82,7 @@ writeFileSync(join(base,'launcher.js'),
   ''
  ].join('\n'),
  {mode:0o755});
-for(const name of ['README.md','LICENSE','CHANGELOG.md']){
+for(const name of ['README.md','LICENSE']){
  const original=join(root,name);if(existsSync(original))copyFileSync(original,join(base,name));
 }
 const bundled=readFileSync(join(base,'cli.js'),'utf8');

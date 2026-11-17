@@ -1,5 +1,8 @@
 import { OAuthAuthorizationServer, OAuthResourceServer } from "@cloudflare/workers-oauth-provider";
 import { handleAuthorize } from "./auth.js";
+import {capRoute} from "./security.js";
+import {manageRoute} from "./manage.js";
+import { handlePairRequest } from "./pairing.js";
 import { handleApiRequest } from "./api.js";
 import { DeviceSession } from "./device-session.js";
 import type { Env, GrantProps } from "./env.js";
@@ -80,8 +83,20 @@ export default {
     const url = new URL(request.url);
     const { origin, authorizationServer, mcpServer, legacyAgentServer, deviceServer } = oauthResourcesFor(env, request);
 
+    if(url.pathname.startsWith("/assets/")){
+      if(request.method!=="GET"&&request.method!=="HEAD")return new Response("Method not allowed",{status:405});
+      return env.ASSETS.fetch(request);
+    }
+    if(url.pathname==="/cap/challenge"||url.pathname==="/cap/redeem")
+      return capRoute(request,env);
+    if(url.pathname==="/manage"||url.pathname==="/manage/token"||url.pathname.startsWith("/manage/api/"))
+      return manageRoute(request,env,authorizationServer.getOAuthApi(env));
     if (url.pathname === "/health" && request.method === "GET") {
-      return Response.json({ status: "ok", service: "deskbeacon-server" });
+      return Response.json({ status: "ok", service: "deskbeacon-server",
+        toolSchema: { desktopAppLaunchArgs: true, desktopAppWorkingDirectory: true } });
+    }
+    if (url.pathname === "/activate" || url.pathname.startsWith("/pair/")) {
+      return handlePairRequest(request, env, authorizationServer.getOAuthApi(env), origin);
     }
     if (url.pathname === "/authorize") {
       return handleAuthorize(request, env, authorizationServer.getOAuthApi(env));

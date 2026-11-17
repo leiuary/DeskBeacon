@@ -7,6 +7,11 @@ const setup=readFileSync(new URL("../../client/src/setup-flow.ts",import.meta.ur
 const callback="http://127.0.0.1:52781/callback";
 
 describe("Device OAuth loopback callback CSP",()=>{
+ it("keeps same-origin HTML form POST Origin usable without leaking cross-site referrers",()=>{
+  const response=page("授权 DeskBeacon",'<form method="post" action="/authorize"><button>授权</button></form>');
+  // no-referrer makes browsers send Origin: null for navigation-mode form POSTs.
+  expect(response.headers.get("referrer-policy")).toBe("same-origin");
+ });
  it("allows the device's random-port HTTP loopback callback without permitting arbitrary HTTP",async()=>{
   const response=page("授权 DeskBeacon",'<form method="post" action="/authorize?client_id=device"><button>授权</button></form>');
   expect(response.status).toBe(200);
@@ -25,12 +30,13 @@ describe("Device OAuth loopback callback CSP",()=>{
   expect(await response.text()).toContain('method="post"');
   expect(callback.startsWith("http://127.0.0.1:")).toBe(true);
  });
- it("keeps server-side redirect and binds the form submission to the authorization endpoint",()=>{
-  expect(auth).toContain('import {htmlEscape, page} from "./auth-page.js"');
-  expect(auth).toContain('status: 302, headers: approved.headers');
-  expect(auth).toContain('approved.headers.set("location", redirectTo)');
-  expect(auth).toContain('status: 302, headers: denied.headers');
-  expect(auth).toContain('action="${htmlEscape(`${formActionUrl.pathname}${formActionUrl.search}`)}"');
+ it("keeps server-side redirect and escapes dynamic OAuth form details",()=>{
+  expect(auth).toContain('import {htmlEscape,page}');
+  expect(auth).toContain('status:302,headers:approved.headers');
+  expect(auth).toContain('approved.headers.set("location",redirectTo)');
+  expect(auth).toContain('status:302,headers:denied.headers');
+  expect(auth).toContain('htmlEscape(url.pathname+url.search)');
+  expect(auth).toContain('data-cap-api-endpoint="/cap/"');
  });
  it("keeps loopback host fixed and port OS-assigned instead of broadening insecure redirects",()=>{
   expect(setup).toContain("callback.listen(0,'127.0.0.1'");

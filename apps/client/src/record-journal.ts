@@ -1,3 +1,4 @@
+import {createPreview,previewFromEdges,splitOutputPreview} from '@deskbeacon/protocol';
 import {createHash} from 'node:crypto';
 import {mkdirSync,openSync,writeSync,readSync,closeSync,statSync,existsSync,fsyncSync} from 'node:fs';
 import {join,dirname,resolve,sep} from 'node:path';
@@ -5,8 +6,8 @@ import {decodeOutputPage,outputEncoding} from './output-encoding.js';
 import {normalizeProcessStderr} from './terminal-errors.js';
 
 export type RecordEvent={v:1;type:string;time:number;[key:string]:unknown};
-export type RecordPage={text:string;nextOffset:number;totalBytes:number;hasMore:boolean;stream:string;available:boolean;encoding?:string};
-type OpenRecord={fd:number;path:string;relativePath:string;operationId:string;bytes:number;stdoutBytes:number;stderrBytes:number;finished:boolean;processExited:boolean;isBackground:boolean};
+export type RecordPage={text:string;nextOffset:number;totalBytes:number;hasMore:boolean;stream:string;available:boolean;encoding?:string;totalLines?:number};
+type OpenRecord={fd:number;path:string;relativePath:string;operationId:string;tool:string;bytes:number;stdoutBytes:number;stderrBytes:number;finished:boolean;processExited:boolean;isBackground:boolean};
 const sensitive=/token|secret|password|cookie|authorization|api[_-]?key|private[_-]?key/i;
 const maxInputBytes=32*1024*1024;
 const maxResultBytes=64*1024*1024;
@@ -33,6 +34,21 @@ function safeSized(value:unknown,max:number,preserveBinary=false):{value:unknown
  if(Buffer.byteLength(raw)<=max)return{value:safe,limited:false};
  return{value:{summary:'Record exceeds local safety budget',originalBytes:Buffer.byteLength(raw),truncated:true},limited:true};
 }
+/** Desktop UI content is private. Journal only safe metadata; raw results still reach the authenticated MCP caller. */
+function desktopJournalSummary(value:unknown,kind:'input'|'result'):Record<string,unknown>{
+ const v=value&&typeof value==='object'?value as Record<string,any>:{};
+ if(kind==='input')return Object.fromEntries(['deviceId','action','kind','condition','refId','windowId','interactionMode','role',
+   'property','event','predicate','timeoutMs','idempotencyKey'].filter(k=>v[k]!==undefined).map(k=>[k,v[k]]));
+ const data=v.data&&typeof v.data==='object'?v.data:{};
+ const error=v.error&&typeof v.error==='object'?v.error:{};
+ return {
+  ok:v.ok??null,command:v.command??null,
+  snapshotId:data.snapshot_id??null,refCount:data.ref_count??null,complete:data.complete??null,
+  disposition:data.disposition??error.disposition??null,
+  errorCode:error.code??v.code??null,sessionId:v.desktop?.sessionId??null,
+  contentRedacted:true
+ };
+}
 export function recordRelativePath(operationId:string,at=Date.now()):string{
  const d=new Date(at),p=(n:number)=>String(n).padStart(2,'0');
  const hash=createHash('sha256').update(operationId).digest('hex');
@@ -54,10 +70,11 @@ export class RecordJournal{
   const at=options.time??Date.now(),relative=recordRelativePath(id,at),path=this.absolute(relative);
   mkdirSync(dirname(path),{recursive:true,mode:0o700});
   const fd=openSync(path,'wx',0o600);
-  const record:OpenRecord={fd,path,relativePath:relative,operationId:id,bytes:0,stdoutBytes:0,stderrBytes:0,finished:false,processExited:false,isBackground:options.isBackground??false};
+  const record:OpenRecord={fd,path,relativePath:relative,operationId:id,tool,bytes:0,stdoutBytes:0,stderrBytes:0,finished:false,processExited:false,isBackground:options.isBackground??false};
   this.open.set(id,record);
   try{
-   const prepared=safeSized(input,maxInputBytes);
+   const prepared=safeSized(tool.startsWith('desktop_')?desktopJournalSummary(input,'input'):
+     tool==='screen_capture'?{target:(input as any)?.target??'screen',monitor:(input as any)?.monitor??null,contentRedacted:true}:input,maxInputBytes);
    this.append(id,{type:'start',operationId:id,tool,parentOperationId:options.parentOperationId??null,input:prepared.value,
     ...(prepared.limited?{inputTruncated:true}:{}),time:at},true);
    fsyncSync(fd); // An accepted side-effecting command must have its journal first.
@@ -72,7 +89,7 @@ export class RecordJournal{
   r.bytes+=line.length;
   if(strict)fsyncSync(r.fd);
  }
- stream(id:string,stream:'stdout'|'stderr',data:Buffer):void{
+ stream(id:string,stream:'stdout'|'stderr'|'diff',data:Buffer):void{
   const r=this.open.get(id);if(!r)throw Error('RECORD_NOT_OPEN');
   for(let i=0;i<data.length;i+=streamChunkBytes){
    const chunk=data.subarray(i,i+streamChunkBytes);
@@ -81,16 +98,19 @@ export class RecordJournal{
    this.append(id,text===undefined?
      {type:'stream',stream,encoding:'base64',data:chunk.toString('base64')}:
      {type:'stream',stream,encoding:'utf8',text});
-   if(stream==='stdout')r.stdoutBytes+=chunk.length;else r.stderrBytes+=chunk.length;
+   if(stream==='stdout')r.stdoutBytes+=chunk.length;
+   else if(stream==='stderr')r.stderrBytes+=chunk.length;
   }
-  if(data.length)this.onOutput?.(id,stream,stream==='stdout'?r.stdoutBytes:r.stderrBytes);
+  if(data.length&&stream!=='diff')this.onOutput?.(id,stream,stream==='stdout'?r.stdoutBytes:r.stderrBytes);
  }
  finish(id:string,result:unknown,status:'completed'|'failed',options:{background?:boolean}={}):void{
   const r=this.open.get(id);if(!r)throw Error('RECORD_NOT_OPEN');
   if(r.finished)throw Error('RECORD_ALREADY_FINISHED');
   const payload:Record<string,unknown>=result&&typeof result==='object'?{...(result as Record<string,unknown>)}:{value:result};
   delete payload.stdout;delete payload.stderr;
-  const safe=safeSized(payload,maxResultBytes,true);
+  const safe=safeSized(r.tool.startsWith('desktop_')?desktopJournalSummary(payload,'result'):
+    r.tool==='screen_capture'?{mimeType:payload.mimeType,width:payload.width,height:payload.height,
+      sizeBytes:payload.sizeBytes,target:payload.target,contentRedacted:true}:payload,maxResultBytes,true);
   if(safe.limited)throw Error('RECORD_RESULT_LIMIT');
   this.append(id,{type:'result',data:safe.value,...(safe.limited?{resultTruncated:true}:{})});
   this.append(id,{type:'call_finish',status,stdoutBytes:r.stdoutBytes,stderrBytes:r.stderrBytes});
@@ -136,13 +156,19 @@ export class RecordJournal{
   }finally{closeSync(fd);}
  }
  getPreview(relative:string):{input:string;result:string}{
-  let input:unknown=null,result:unknown=null,tail='',tool='';
+  let input:unknown=null,result:unknown=null,tail='',head='',tool='',stdoutChars=0;
+  let stdoutBytes=0,stdoutNewlines=0,stdoutEndsNewline=false;
   for(const e of this.events(relative)){
    if(e.type==='start'){input=e.input;tool=String(e.tool??'');}
    else if(e.type==='result')result=e.data;
    else if(e.type==='stream'&&e.stream==='stdout'){
     const part=e.encoding==='base64'?new TextDecoder('utf-8').decode(Buffer.from(String(e.data??''),'base64')):String(e.text??'');
-    tail=(tail+part).slice(-384);
+    stdoutChars+=part.length;
+    stdoutBytes+=Buffer.byteLength(part,'utf8');
+    stdoutNewlines+=(part.match(/\n/g)??[]).length;
+    stdoutEndsNewline=part.endsWith('\n');
+    head=(head+part).slice(0,4096);
+    tail=(tail+part).slice(-4096);
    }
   }
   const preview=(value:unknown,limit:number,kind:'input'|'result')=>{
@@ -151,26 +177,93 @@ export class RecordJournal{
    // Preserve compact file metadata when a JSONL preview exceeds the list limit.
    // Full file content is still available through the on-demand IPC inspector.
    const object=value&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:{};
+   if(tool==='fs_edit'&&kind==='result'){
+    const {path,sha256,bytes,replacements,normalizedEol,changed,dryRun,addedLines,removedLines,
+      diffStored,diffBytes,diffTruncated}=object;
+    let rendered:{diff:string;diffPreviewMeta:object}|undefined;
+    if(typeof object.diff==='string'){
+     const old=object.diffPreviewMeta as {
+      originalBytes?:number;totalLines?:number;truncated?:boolean;hasFullOutput?:boolean;
+      omissionStart?:number;omissionEnd?:number;omissionDirection?:'head'|'middle'|'tail'
+     }|undefined;
+     const split=old&&typeof object.diff==='string'?splitOutputPreview({
+      text:object.diff,truncated:Boolean(old.truncated),
+      ...(old.omissionStart===undefined?{}:{omissionStart:old.omissionStart}),
+      ...(old.omissionEnd===undefined?{}:{omissionEnd:old.omissionEnd}),
+      ...(old.omissionDirection===undefined?{}:{omissionDirection:old.omissionDirection})
+     }):null;
+     const next=split&&old?.truncated&&old.originalBytes!==undefined
+      ?previewFromEdges(split.head,split.tail,old.originalBytes,2048,{
+        ...(old.hasFullOutput===undefined?{}:{hasFullOutput:old.hasFullOutput}),
+        ...(old.totalLines===undefined?{}:{totalLines:old.totalLines})
+       })
+      :createPreview(object.diff,2048);
+     const {text,...meta}=next;
+     rendered={diff:text,diffPreviewMeta:meta};
+    }
+    return JSON.stringify({path,sha256,bytes,replacements,normalizedEol,changed,dryRun,
+      addedLines,removedLines,diffStored,diffBytes,diffTruncated,...rendered,
+      previewLimited:true});
+   }
+   if(tool==='fs_edit'&&kind==='input'){
+    const {path,mode,expectedHash,dryRun}=object;
+    const preview=createPreview(raw,3072);
+    const {text,...previewInputMeta}=preview;
+    return JSON.stringify({path,mode,expectedHash,dryRun,
+      previewInput:text,previewInputMeta,previewLimited:true});
+   }
    if(tool==='fs_write'&&kind==='input'){
     const {path,mode,encoding,overwrite,workspaceId}=object;
-    return JSON.stringify({path,mode,encoding,overwrite,workspaceId,previewLimited:true});
+    const content=typeof object.content==='string'?createPreview(object.content,3072):null;
+    const {text,...contentMeta}=content??createPreview('',3072);
+    return JSON.stringify({path,mode,encoding,overwrite,workspaceId,
+      ...(content?{content:text,contentPreviewMeta:contentMeta}:{}),
+      previewLimited:true});
    }
    if(tool==='fs_read'&&kind==='result'){
     const {path,encoding,readBytes,totalBytes,linesRead,lineOffset,truncated}=object;
-    return JSON.stringify({path,encoding,readBytes,totalBytes,linesRead,lineOffset,truncated,previewLimited:true});
+    const content=typeof object.content==='string'?createPreview(object.content,3072):null;
+    const {text,...contentMeta}=content??createPreview('',3072);
+    return JSON.stringify({path,encoding,readBytes,totalBytes,linesRead,lineOffset,truncated,
+      ...(content?{content:text,contentPreviewMeta:contentMeta}:{}),
+      previewLimited:true});
    }
    if(tool==='fs_read_many'&&kind==='result'){
     const {successCount,failureCount,bytesUsed,truncated}=object;
-    const files=Array.isArray(object.files)?object.files.slice(0,20).map(value=>{
+    const files=Array.isArray(object.files)?object.files.map(value=>{
      if(!value||typeof value!=='object')return{};
-     const {path,readBytes,lineOffset,error}=value as Record<string,unknown>;
-     return {path,readBytes,lineOffset,error};
+     const {path,readBytes,lineOffset,error,content}=value as Record<string,unknown>;
+     if(typeof content!=='string')return{path,readBytes,lineOffset,error};
+     const preview=createPreview(content,Math.max(256,Math.floor(3500/(Array.isArray(object.files)?object.files.length:1))));
+     const {text,...contentPreviewMeta}=preview;
+     return{path,readBytes,lineOffset,error,content:text,
+      contentPreviewMeta};
     }):[];
     return JSON.stringify({successCount,failureCount,bytesUsed,truncated,files,previewLimited:true});
    }
    return JSON.stringify({summary:'预览过长，请查看完整日志',previewLimited:true});
   };
-  if(result&&typeof result==='object'&&tail)(result as Record<string,unknown>).outputPreview=tail.trim();
+  if(result&&typeof result==='object'&&tail){
+   const output=result as Record<string,unknown>;
+   // A bounded self-contained preview is created while scanning the journal:
+   // no delayed second fetch is needed to hydrate the selected DETAIL.
+   if(head.length&&/[\uD800-\uDBFF]/.test(head.at(-1)??''))head=head.slice(0,-1);
+   if(tail.length&&/[\uDC00-\uDFFF]/.test(tail[0]??''))tail=tail.slice(1);
+   const totalLines=stdoutNewlines+(stdoutBytes&&!stdoutEndsNewline?1:0);
+   // Escaping quotes/backslashes can inflate JSON far beyond the byte budget;
+   // fit the cached snapshot before returning, never replacing it with a
+   // content-free "preview too long" record.
+   for(const budget of [4096,3072,2048,1024,512]){
+    const outputPreview=previewFromEdges(head,tail,stdoutBytes,budget,{totalLines});
+    const {text:previewText,...previewMetadata}=outputPreview;
+    output.outputPreview=previewText;
+    output.outputPreviewKind='head_tail';
+    output.outputPreviewMeta=previewMetadata;
+    output.outputPreviewOmittedBytes=outputPreview.omittedBytes;
+    if(outputPreview.truncated)output.previewTruncated=true;
+    if(JSON.stringify(output).length<=6000)break;
+   }
+  }
   return{input:preview(input,6000,'input'),result:preview(result,6000,'result')};
  }
 
@@ -201,7 +294,7 @@ export class RecordJournal{
  getResultRaw(relative:string):string|null{
   const value=this.getResult(relative);return value?JSON.stringify(value.result):null;
  }
- getRecordStream(relative:string,stream:'stdout'|'stderr'|'input'|'result',offset:number,budget:number):RecordPage{
+ getRecordStream(relative:string,stream:'stdout'|'stderr'|'input'|'result'|'diff',offset:number,budget:number):RecordPage{
   if(!Number.isSafeInteger(offset)||offset<0||!Number.isInteger(budget)||budget<1||budget>1048576)throw Error('INVALID_RECORD_CURSOR');
   if(!this.exists(relative))return{text:'',nextOffset:0,totalBytes:0,hasMore:false,stream,available:false};
   if(stream==='input'||stream==='result'){
@@ -209,7 +302,7 @@ export class RecordJournal{
    if(value===null||value===undefined)return{text:'',nextOffset:0,totalBytes:0,hasMore:false,stream,available:false};
    return bufferPage(Buffer.from(JSON.stringify(value),'utf8'),stream,offset,budget);
   }
-  const parts:Buffer[]=[];let total=0,from=offset,selected=0;
+  const parts:Buffer[]=[];let total=0,from=offset,selected=0,newlines=0,finalByte=-1;
   for(const e of this.events(relative)){
    if(e.type!=='stream'||e.stream!==stream)continue;
    const b=e.encoding==='base64'?Buffer.from(String(e.data??''),'base64'):Buffer.from(String(e.text??''),'utf8');
@@ -218,11 +311,15 @@ export class RecordJournal{
     const start=Math.max(0,from-total),slice=b.subarray(start,start+budget+4-selected);
     parts.push(slice);selected+=slice.length;from=total+b.length;
    }
+   for(const byte of b)if(byte===10)newlines++;
+   if(b.length)finalByte=b[b.length-1]!;
    total+=b.length;
   }
   if(offset>total)throw Error('INVALID_BYTE_OFFSET');
   const bytes=Buffer.concat(parts),encoding=outputEncoding(bytes),page=decodeOutputPage(bytes,budget,encoding);
-  return{text:page.text,nextOffset:offset+page.used,totalBytes:total,hasMore:offset+page.used<total,stream,available:true,encoding};
+  return{text:page.text,nextOffset:offset+page.used,totalBytes:total,
+    totalLines:newlines+(total>0&&finalByte!==10?1:0),
+    hasMore:offset+page.used<total,stream,available:true,encoding};
  }
  getTail(relative:string,stream:'stdout'|'stderr',maxBytes=4096):RecordPage{
   const raw=this.getRecordStream(relative,stream,0,1);

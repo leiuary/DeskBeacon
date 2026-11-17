@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { TOOL_NAMES, toolInputSchemas } from '@deskbeacon/protocol';
 import ts from 'typescript';
-const parsed=ts.parseConfigFileTextToJson('wrangler.jsonc',readFileSync(new URL('../wrangler.jsonc',import.meta.url),'utf8'));
+const parsed=ts.parseConfigFileTextToJson('wrangler.jsonc',readFileSync(new URL('../../../wrangler.jsonc',import.meta.url),'utf8'));
 if(parsed.error)throw Error(ts.flattenDiagnosticMessageText(parsed.error.messageText,'\n'));
 const wrangler=parsed.config;
 describe('Server static contract',()=>{
@@ -13,13 +13,21 @@ describe('Server static contract',()=>{
   expect(wrangler.d1_databases).toBeUndefined();
   expect(wrangler.r2_buckets).toBeUndefined();
  });
- it('defines 36 MCP tools',()=>{
-  expect(TOOL_NAMES).toHaveLength(36);
+ it('defines core and initial Desktop MCP tools',()=>{
+  expect(TOOL_NAMES).toHaveLength(50);
   expect(TOOL_NAMES).toContain('batch');
   expect(TOOL_NAMES).toContain('fs_archive');
   expect(TOOL_NAMES).toContain('fs_read_many');
   expect(TOOL_NAMES).toContain('net_probe');
   expect(TOOL_NAMES).toContain('screen_capture');
+ });
+ it('includes desktop launch args in the server-visible tool schema',()=>{
+  // The Worker registers toolInputSchemas directly; these fields must survive public schema conversion.
+  const appSchema=toolInputSchemas.desktop_app;
+  expect(appSchema.safeParse({deviceId:'test',action:'launch',app:'notepad',
+    launchArgs:['example.txt'],workingDirectory:'C:\\Temp'}).success).toBe(true);
+  expect(appSchema.safeParse({deviceId:'test',action:'close',app:'notepad',
+    launchArgs:['example.txt']}).success).toBe(false);
  });
  it('rejects invalid exec input before dispatch',()=>{
   expect(toolInputSchemas.exec_foreground.safeParse({deviceId:'dev',description:'test',
